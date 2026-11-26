@@ -1,0 +1,103 @@
+/*
+ * This file is part of GADS.
+ *
+ * Copyright (c) 2022-2025 Nikola Shabanov
+ *
+ * This source code is licensed under the GNU Affero General Public License v3.0.
+ * You may obtain a copy of the license at https://www.gnu.org/licenses/agpl-3.0.html
+ */
+
+package main
+
+import (
+	"GADS/client/adb"
+	"GADS/hub"
+	"GADS/provider"
+	"embed"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/spf13/cobra"
+)
+
+var AppVersion = "development"
+
+//go:embed resources
+var resourceFiles embed.FS
+
+func main() {
+	var rootCmd = &cobra.Command{Use: "GADS"}
+	rootCmd.PersistentFlags().String("mongo-db", "localhost:27017", "The address of the MongoDB instance")
+
+	// Hub Command
+	var hubCmd = &cobra.Command{
+		Use:   "hub",
+		Short: "Run a hub component",
+		Run: func(cmd *cobra.Command, args []string) {
+			hub.StartHub(cmd.Flags(), AppVersion, uiFiles, resourceFiles)
+		},
+	}
+	hubCmd.Flags().String("host-address", "localhost", "The IP address of the host machine")
+	hubCmd.Flags().String("port", "", "The port on which the component should run")
+	hubCmd.Flags().Bool("auth", true, "Enable or disable authentication on hub endpoints, default is `true`")
+	hubCmd.Flags().String("files-dir", "", "Directory where resource files will be unpacked."+
+		"\nBy default app will try to use a temp dir on the host, use this flag only if you encounter issues with the temp folder."+
+		"\nAlso you need to have created the folder in advance!")
+	hubCmd.Flags().String("turn-username-suffix", "gads", "Suffix to append to TURN usernames (format: timestamp:suffix)")
+	hubCmd.Flags().Duration("token-ttl", time.Hour, "Validity of issued authentication tokens."+
+		"\nTokens are automatically renewed while they are being used, so this is effectively an inactivity timeout")
+	hubCmd.Flags().Duration("max-session-age", 24*time.Hour, "Maximum total lifetime of a user session, no matter how many times its token was renewed."+
+		"\nUse 0 for no limit. Tokens from the OAuth2 client credentials flow are not affected")
+	rootCmd.AddCommand(hubCmd)
+
+	// Provider Command
+	var providerCmd = &cobra.Command{
+		Use:   "provider",
+		Short: "Run a provider component",
+		Run: func(cmd *cobra.Command, args []string) {
+			provider.StartProvider(cmd.Flags(), resourceFiles)
+		},
+	}
+	providerCmd.Flags().String("nickname", "", "Nickname of the provider")
+	providerCmd.Flags().String("provider-folder", ".", "The folder where logs and other data will be stored")
+	providerCmd.Flags().String("log-level", "info", "The verbosity of the logs of the provider instance")
+	providerCmd.Flags().String("hub", "", "The address of the GADS hub instance")
+	providerCmd.Flags().String("turn-username-suffix", "gads", "Suffix to append to TURN usernames (format: timestamp:suffix)")
+	providerCmd.Flags().Bool("use-ios-pair-cache", false, "Cache iOS pair records on disk to skip Trust dialog on reconnect (for unsupervised devices)")
+	rootCmd.AddCommand(providerCmd)
+
+	// ADB Tunnel Command
+	var adbTunnelCmd = &cobra.Command{
+		Use:   "adb-tunnel",
+		Short: "Connect to a remote Android device via ADB tunnel through the hub",
+		Run: func(cmd *cobra.Command, args []string) {
+			adb.Start(cmd.Flags())
+		},
+	}
+	adbTunnelCmd.Flags().String("hub", "", "Hub URL (e.g. http://localhost:10000)")
+	adbTunnelCmd.Flags().String("udid", "", "Device UDID to tunnel")
+	adbTunnelCmd.Flags().String("username", "", "GADS username")
+	adbTunnelCmd.Flags().String("password", "", "GADS password")
+	adbTunnelCmd.Flags().Int("port", 0, "Local port to listen on (0 = auto)")
+	adbTunnelCmd.MarkFlagRequired("hub")
+	adbTunnelCmd.MarkFlagRequired("udid")
+	adbTunnelCmd.MarkFlagRequired("username")
+	adbTunnelCmd.MarkFlagRequired("password")
+	rootCmd.AddCommand(adbTunnelCmd)
+
+	var versionCmd = &cobra.Command{
+		Use:   "version",
+		Short: "Print the application version",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Println(AppVersion)
+		},
+	}
+	rootCmd.AddCommand(versionCmd)
+
+	// Execute the root command
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}

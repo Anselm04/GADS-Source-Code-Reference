@@ -1,0 +1,5 @@
+Upstream: https://github.com/shamanec/GADS
+Revision: d8abfc32e282d872a08484cd6a1e4a535c0cebe9
+Copied files: 166
+Excluded files: 2
+AGPL-3.0 reference only; proprietary hub-ui submodule and upstream automation excluded. Original licensing notices retained. No commercial integration approved. Snapshot modified 2026-11-26 by these exclusions.

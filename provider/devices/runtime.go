@@ -1,0 +1,271 @@
+/*
+ * This file is part of GADS.
+ *
+ * Copyright (c) 2022-2025 Nikola Shabanov
+ *
+ * This source code is licensed under the GNU Affero General Public License v3.0.
+ * You may obtain a copy of the license at https://www.gnu.org/licenses/agpl-3.0.html
+ */
+
+package devices
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/Masterminds/semver"
+
+	"GADS/common"
+	"GADS/common/models"
+	"GADS/provider/logger"
+	"GADS/provider/providerutil"
+)
+
+const (
+	setupBackoffBase = 10 * time.Second
+	setupBackoffMax  = 60 * time.Second
+)
+
+// RuntimeState holds runtime fields shared across all platform device types.
+// Each concrete device type (AndroidDevice, IOSDevice, etc.) embeds this struct
+// to inherit common state and accessor methods.
+type RuntimeState struct {
+	// DB model — the MongoDB device record, owned by this RuntimeState
+	DBDevice models.DBDevice
+
+	// Infrastructure
+	Context              context.Context
+	CtxCancel            context.CancelFunc
+	Mutex                sync.Mutex
+	appiumStateMu        sync.RWMutex
+	AppiumLifecycleMutex sync.Mutex // serializes session creation/deletion, not ordinary commands
+	SetupMutex           sync.Mutex
+	Logger               models.CustomLogger
+	SemVer               *semver.Version
+	InitialSetupDone     bool
+	AppiumPort           string // port assigned to the device for the Appium server
+
+	// Runtime fields synced to hub
+	Host          string
+	Connected     bool
+	ProviderState string
+
+	// Serial is the transport-level identifier used for local device commands
+	// (e.g. `adb -s`). Left empty for devices whose UDID is the transport id —
+	// GetSerial falls back to the UDID then. Only set when the GADS identity
+	// deliberately differs from the transport id (e.g. Android emulators, where
+	// the UDID is synthesized from the AVD name but adb needs `emulator-5554`).
+	Serial string
+
+	// Ephemeral marks a device that exists only in memory (provider DevManager +
+	// hub device store) and must never be persisted to the DB. Set once at
+	// creation for discovered Android emulators, before the device is visible in
+	// DevManager, and read-only afterwards.
+	Ephemeral bool
+
+	// Provider-only runtime fields
+	HardwareModel        string
+	IsResetting          bool
+	StreamTargetFPS      int
+	StreamJpegQuality    int
+	StreamScalingFactor  int
+	AppiumLastPingTS     int64
+	AppiumLastCommandTS  int64
+	AppiumSessionID      string
+	AppiumSessionCaps    map[string]interface{}
+	IsAppiumUp           bool
+	HasAppiumSession     bool
+	CurrentRotation      string
+	SupportedStreamTypes []models.StreamType
+	InstalledApps        []string
+
+	// Per-device setup backoff state, protected by SetupMutex
+	setupBackoffUntil time.Time
+	setupBackoffNext  time.Duration
+}
+
+// Common accessor implementations inherited by all platform types via embedding.
+
+func (r *RuntimeState) GetUDID() string { return r.DBDevice.UDID }
+func (r *RuntimeState) GetSerial() string {
+	if r.Serial != "" {
+		return r.Serial
+	}
+	return r.DBDevice.UDID
+}
+func (r *RuntimeState) IsEphemeral() bool              { return r.Ephemeral }
+func (r *RuntimeState) GetOS() string                  { return r.DBDevice.OS }
+func (r *RuntimeState) GetDBDevice() *models.DBDevice  { return &r.DBDevice }
+func (r *RuntimeState) GetProviderState() string       { return r.ProviderState }
+func (r *RuntimeState) SetProviderState(state string)  { r.ProviderState = state }
+func (r *RuntimeState) IsConnected() bool              { return r.Connected }
+func (r *RuntimeState) SetConnected(connected bool)    { r.Connected = connected }
+func (r *RuntimeState) GetHost() string                { return r.Host }
+func (r *RuntimeState) SetHost(host string)            { r.Host = host }
+func (r *RuntimeState) GetLogger() models.CustomLogger { return r.Logger }
+func (r *RuntimeState) GetContext() context.Context    { return r.Context }
+func (r *RuntimeState) GetAppiumPort() string          { return r.AppiumPort }
+func (r *RuntimeState) SetAppiumPort(port string)      { r.AppiumPort = port }
+func (r *RuntimeState) GetAppiumSessionID() string {
+	r.appiumStateMu.Lock()
+	defer r.appiumStateMu.Unlock()
+	return r.AppiumSessionID
+}
+func (r *RuntimeState) SetAppiumSessionID(id string) {
+	r.appiumStateMu.Lock()
+	defer r.appiumStateMu.Unlock()
+	r.AppiumSessionID = id
+}
+func (r *RuntimeState) SetAppiumUp(up bool) {
+	r.appiumStateMu.Lock()
+	defer r.appiumStateMu.Unlock()
+	r.IsAppiumUp = up
+}
+func (r *RuntimeState) SetAppiumLastPingTS(ts int64) {
+	r.appiumStateMu.Lock()
+	defer r.appiumStateMu.Unlock()
+	r.AppiumLastPingTS = ts
+}
+func (r *RuntimeState) SetAppiumLastCommandTS(ts int64) {
+	r.appiumStateMu.Lock()
+	defer r.appiumStateMu.Unlock()
+	r.AppiumLastCommandTS = ts
+}
+func (r *RuntimeState) SetHasAppiumSession(has bool) {
+	r.appiumStateMu.Lock()
+	defer r.appiumStateMu.Unlock()
+	r.HasAppiumSession = has
+}
+func (r *RuntimeState) SetAppiumSessionCaps(caps map[string]interface{}) {
+	r.appiumStateMu.Lock()
+	defer r.appiumStateMu.Unlock()
+	r.AppiumSessionCaps = caps
+}
+func (r *RuntimeState) GetAppiumSessionCaps() map[string]interface{} {
+	r.appiumStateMu.RLock()
+	defer r.appiumStateMu.RUnlock()
+	return r.AppiumSessionCaps
+}
+func (r *RuntimeState) GetIsResetting() bool  { return r.IsResetting }
+func (r *RuntimeState) SetIsResetting(v bool) { r.IsResetting = v }
+func (r *RuntimeState) GetIsAppiumUp() bool {
+	r.appiumStateMu.Lock()
+	defer r.appiumStateMu.Unlock()
+	return r.IsAppiumUp
+}
+func (r *RuntimeState) GetHardwareModelValue() string                { return r.HardwareModel }
+func (r *RuntimeState) SetHardwareModel(model string)                { r.HardwareModel = model }
+func (r *RuntimeState) GetStreamTargetFPS() int                      { return r.StreamTargetFPS }
+func (r *RuntimeState) SetStreamTargetFPS(fps int)                   { r.StreamTargetFPS = fps }
+func (r *RuntimeState) GetStreamJpegQuality() int                    { return r.StreamJpegQuality }
+func (r *RuntimeState) SetStreamJpegQuality(q int)                   { r.StreamJpegQuality = q }
+func (r *RuntimeState) GetStreamScalingFactor() int                  { return r.StreamScalingFactor }
+func (r *RuntimeState) SetStreamScalingFactor(f int)                 { r.StreamScalingFactor = f }
+func (r *RuntimeState) GetCurrentRotationValue() string              { return r.CurrentRotation }
+func (r *RuntimeState) SetCurrentRotation(rotation string)           { r.CurrentRotation = rotation }
+func (r *RuntimeState) GetSupportedStreamTypes() []models.StreamType { return r.SupportedStreamTypes }
+func (r *RuntimeState) SetSupportedStreamTypes(types []models.StreamType) {
+	r.SupportedStreamTypes = types
+}
+func (r *RuntimeState) GetInstalledAppIDs() []string     { return r.InstalledApps }
+func (r *RuntimeState) SetInstalledAppIDs(apps []string) { r.InstalledApps = apps }
+func (r *RuntimeState) SetNewContext(ctx context.Context, cancel context.CancelFunc) {
+	r.Context = ctx
+	r.CtxCancel = cancel
+}
+
+// ToSyncUpdate builds the lightweight struct sent to the hub each second.
+func (r *RuntimeState) ToSyncUpdate() models.ProviderDeviceSync {
+	r.appiumStateMu.RLock()
+	defer r.appiumStateMu.RUnlock()
+	syncUpdate := models.ProviderDeviceSync{
+		UDID:                      r.DBDevice.UDID,
+		Host:                      r.Host,
+		Connected:                 r.Connected,
+		ProviderState:             r.ProviderState,
+		ReportsAppiumSessionState: true,
+		HasAppiumSession:          r.HasAppiumSession,
+		AppiumSessionID:           r.AppiumSessionID,
+		AppiumLastCommandTS:       r.AppiumLastCommandTS,
+	}
+
+	// Ephemeral devices have no DB record the hub could build its store entry
+	// from, so the full device descriptor rides along with every update
+	if r.Ephemeral {
+		deviceCopy := r.DBDevice
+		syncUpdate.Ephemeral = true
+		syncUpdate.EphemeralDevice = &deviceCopy
+	}
+
+	return syncUpdate
+}
+
+// ResetBase cancels the device context, frees the Appium port, and resets state to "init".
+// Platform types should call this from their own Reset() method after doing platform-specific cleanup.
+func (r *RuntimeState) ResetBase(reason string) bool {
+	r.Mutex.Lock()
+	defer r.Mutex.Unlock()
+	if !r.IsResetting && r.ProviderState != "init" {
+		logger.ProviderLogger.LogInfof("provider", "Resetting LocalDevice for device `%v` with reason: %s. Cancelling context, setting ProviderState to `init`, Healthy to `false` and updating the DB", r.DBDevice.UDID, reason)
+
+		r.IsResetting = true
+		if r.CtxCancel != nil {
+			r.CtxCancel()
+		}
+		r.ProviderState = "init"
+		r.IsResetting = false
+
+		// Free AppiumPort (common to all platforms)
+		common.MutexManager.LocalDevicePorts.Lock()
+		delete(providerutil.UsedPorts, r.AppiumPort)
+		common.MutexManager.LocalDevicePorts.Unlock()
+		return true
+	}
+	return false
+}
+
+// Reset is the default reset implementation. Platform types with ports or tunnels should override this.
+func (r *RuntimeState) Reset(reason string) {
+	r.ResetBase(reason)
+}
+
+// resetWithError logs an error, resets the device, and returns the error — used by Setup() step methods.
+func (r *RuntimeState) resetWithError(step string, err error) error {
+	logger.ProviderLogger.LogErrorf("device_setup", "Failed to %s for device `%s` - %v", step, r.GetUDID(), err)
+	// For iOS devices attach recent go-ios output to the device logs for diagnostics
+	if r.DBDevice.OS == "ios" && r.Logger != nil {
+		if tail := logger.GoIOSLogs.Tail(r.GetUDID(), 150); tail != "" {
+			r.Logger.LogErrorf("go_ios_logs", "Recent go-ios logs for device `%s`:\n%s", r.GetUDID(), tail)
+		}
+	}
+	r.Reset(fmt.Sprintf("Failed to %s", step))
+	return fmt.Errorf("%s: %w", step, err)
+}
+
+// LockAppiumLifecycle reserves this device's session transition until the
+// upstream operation completes. Plugin callbacks must not acquire this lock.
+func (r *RuntimeState) LockAppiumLifecycle() func() {
+	r.AppiumLifecycleMutex.Lock()
+	return r.AppiumLifecycleMutex.Unlock
+}
+
+// UpdateAppiumSession publishes a coherent session snapshot to the hub.
+func (r *RuntimeState) UpdateAppiumSession(id string, caps map[string]interface{}) {
+	r.appiumStateMu.Lock()
+	defer r.appiumStateMu.Unlock()
+	r.AppiumSessionID, r.HasAppiumSession, r.AppiumSessionCaps = id, id != "", caps
+}
+
+// ClearAppiumSession ignores delayed notifications for a superseded session.
+// Empty IDs retain compatibility with older plugins.
+func (r *RuntimeState) ClearAppiumSession(id string) bool {
+	r.appiumStateMu.Lock()
+	defer r.appiumStateMu.Unlock()
+	if id != "" && r.AppiumSessionID != id {
+		return false
+	}
+	r.AppiumSessionID, r.HasAppiumSession, r.AppiumSessionCaps = "", false, nil
+	return true
+}

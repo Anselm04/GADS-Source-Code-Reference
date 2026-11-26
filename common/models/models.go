@@ -1,0 +1,389 @@
+/*
+ * This file is part of GADS.
+ *
+ * Copyright (c) 2022-2025 Nikola Shabanov
+ *
+ * This source code is licensed under the GNU Affero General Public License v3.0.
+ * You may obtain a copy of the license at https://www.gnu.org/licenses/agpl-3.0.html
+ */
+
+package models
+
+import (
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
+)
+
+type CustomLogger interface {
+	LogDebug(eventName string, message string)
+	LogInfo(eventName string, message string)
+	LogError(eventName string, message string)
+	LogWarn(eventName string, message string)
+	LogFatal(eventName string, message string)
+	LogPanic(eventName string, message string)
+	LogDebugf(eventName string, format string, args ...any)
+	LogInfof(eventName string, format string, args ...any)
+	LogErrorf(eventName string, format string, args ...any)
+	LogWarnf(eventName string, format string, args ...any)
+	LogFatalf(eventName string, format string, args ...any)
+	LogPanicf(eventName string, format string, args ...any)
+}
+
+type User struct {
+	Username     string   `json:"username" bson:"username" example:"john_doe"`
+	Password     string   `json:"password" bson:"password,omitempty" example:"secure_password"`
+	Role         string   `json:"role,omitempty" bson:"role" example:"user" enums:"admin,user"`
+	ID           string   `json:"_id" bson:"_id,omitempty" example:"507f1f77bcf86cd799439011"`
+	WorkspaceIDs []string `json:"workspace_ids" bson:"workspace_ids" example:"workspace_id_1,workspace_id_2"`
+}
+
+type DBDevice struct {
+	UDID         string `json:"udid" bson:"udid"`                   // device UDID
+	OS           string `json:"os" bson:"os"`                       // device OS
+	Name         string `json:"name" bson:"name"`                   // name of the device
+	OSVersion    string `json:"os_version" bson:"os_version"`       // OS version of the device
+	IPAddress    string `json:"ip_address" bson:"ip_address"`       // IP address of the device
+	Provider     string `json:"provider" bson:"provider"`           // nickname of the device host(provider)
+	Usage        string `json:"usage" bson:"usage"`                 // what is the device used for: enabled(automation and remote control), automation(only Appium testing), control(only remote control), disabled
+	ScreenWidth  string `json:"screen_width" bson:"screen_width"`   // screen width of device
+	ScreenHeight string `json:"screen_height" bson:"screen_height"` // screen height of device
+	DeviceType   string `json:"device_type" bson:"device_type"`     // The type of device - `real` or `emulator`
+	// DEPRECATED: UseWebRTCVideo will be deprecated, use StreamType instead.
+	// This field will be removed in next major version release. Only kept for backward compatibility during migration.
+	UseWebRTCVideo bool          `json:"use_webrtc_video" bson:"use_webrtc_video"` // Should the device use WebRTC video instead of MJPEG
+	WorkspaceID    string        `json:"workspace_id" bson:"workspace_id"`         // ID of the associated workspace
+	StreamType     StreamingType `json:"stream_type" bson:"stream_type"`           // The type of video streaming for the device
+	// Enable audio streaming alongside the WebRTC video stream.
+	AudioStreamEnabled bool `json:"audio_stream_enabled" bson:"audio_stream_enabled"`
+	// Audio input source. Android: "internal" (AudioPlaybackCapture, API 29+, default) or "microphone" (TRRS).
+	AudioInputType string `json:"audio_input_type" bson:"audio_input_type"`
+	// AudioPort is the provider-only host port forwarded to the device audio stream. Runtime state, not persisted.
+	AudioPort string `json:"-" bson:"-"`
+}
+
+// AndroidDisplay represents a physical display on an Android device (e.g. foldable inner/outer screen).
+type AndroidDisplay struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// Device stream type - mjpeg, webrtc, etc
+type StreamType struct {
+	Name     string        `json:"name" bson:"-"`
+	ID       StreamingType `json:"id" bson:"-"`
+	DeviceOS string        `json:"device_os" bson:"-"`
+}
+
+// Custom type for DB streaming type property
+type StreamingType string
+
+const (
+	MJPEGStreamTypeId                 StreamingType = "mjpeg"
+	IOSWebRTCFFMpegStreamTypeId       StreamingType = "ios_webrtc_ffmpeg"
+	AndroidWebRTCGadsH264StreamTypeId StreamingType = "android_webrtc_gads_h264"
+	IOSWebRTCBroadcastExtensionId     StreamingType = "ios_webrtc_broadcast"
+
+	// Deprecated: the GetStream WebRTC integration was removed from the GADS Android app.
+	// Kept only to migrate devices with this stream type to AndroidWebRTCGadsH264StreamTypeId.
+	AndroidWebRTCGetStreamStreamTypeId StreamingType = "android_webrtc_getstream"
+)
+
+// IsWebRTCStreamType checks if the given StreamType is a WebRTC-based stream
+func IsWebRTCStreamType(st StreamingType) bool {
+	return st == AndroidWebRTCGadsH264StreamTypeId ||
+		st == IOSWebRTCFFMpegStreamTypeId ||
+		st == IOSWebRTCBroadcastExtensionId
+}
+
+func (st StreamingType) Description() string {
+	switch st {
+	case MJPEGStreamTypeId:
+		return "MJPEG"
+	case IOSWebRTCFFMpegStreamTypeId:
+		return "WebRTC - FFMpeg"
+	case AndroidWebRTCGadsH264StreamTypeId:
+		return "Android WebRTC GADS H264"
+	case IOSWebRTCBroadcastExtensionId:
+		return "WebRTC - Broadcast Extension"
+	default:
+		return "Unknown"
+	}
+}
+
+var MJPEGStreamType = StreamType{
+	Name:     MJPEGStreamTypeId.Description(),
+	ID:       MJPEGStreamTypeId,
+	DeviceOS: "both",
+}
+
+var IOSWebRTCFFMpegStreamType = StreamType{
+	Name:     IOSWebRTCFFMpegStreamTypeId.Description(),
+	ID:       IOSWebRTCFFMpegStreamTypeId,
+	DeviceOS: "ios",
+}
+
+var AndroidWebRTCGadsH264StreamType = StreamType{
+	Name:     AndroidWebRTCGadsH264StreamTypeId.Description(),
+	ID:       AndroidWebRTCGadsH264StreamTypeId,
+	DeviceOS: "android",
+}
+
+var IOSWebRTCBroadcastExtensionStreamType = StreamType{
+	Name:     IOSWebRTCBroadcastExtensionId.Description(),
+	ID:       IOSWebRTCBroadcastExtensionId,
+	DeviceOS: "ios",
+}
+
+var IOSStreamTypes = []StreamType{
+	MJPEGStreamType,
+	IOSWebRTCFFMpegStreamType,
+	IOSWebRTCBroadcastExtensionStreamType,
+}
+
+var AndroidStreamTypes = []StreamType{
+	MJPEGStreamType,
+	AndroidWebRTCGadsH264StreamType,
+}
+
+func StreamTypesForOS(os string) []StreamType {
+	switch os {
+	case "ios":
+		return IOSStreamTypes
+	case "android":
+		return AndroidStreamTypes
+	default:
+		return []StreamType{}
+	}
+}
+
+type DeviceStreamSettings struct {
+	UDID                string `json:"udid" bson:"udid"`                                             // device UDID
+	StreamTargetFPS     int    `json:"stream_target_fps,omitempty" bson:"stream_target_fps"`         // The target FPS for the MJPEG video streams
+	StreamJpegQuality   int    `json:"stream_jpeg_quality,omitempty" bson:"stream_jpeg_quality"`     // The target JPEG quality for the MJPEG video streams
+	StreamScalingFactor int    `json:"stream_scaling_factor,omitempty" bson:"stream_scaling_factor"` // The target scaling factor for the MJPEG video streams
+}
+
+type IOSModelData struct {
+	Width  string
+	Height string
+	Model  string
+}
+
+type UpdateStreamSettings struct {
+	TargetFPS     int `json:"target_fps,omitempty"`
+	JpegQuality   int `json:"jpeg_quality,omitempty"`
+	ScalingFactor int `json:"scaling_factor,omitempty"`
+}
+
+type DBFile struct {
+	ID         string             `json:"id" bson:"_id"`
+	FileName   string             `json:"name" bson:"filename"`
+	UploadDate primitive.DateTime `json:"upload_date" bson:"uploadDate"`
+	Metadata   DBFileMetadata     `json:"metadata" bson:"metadata"`
+}
+
+// DBFileMetadata holds the custom GridFS metadata attached to uploaded files.
+// WebDriverAgent IPAs carry a description and uploader so multiple builds can be
+// told apart; the supervision profile only records who last replaced it.
+type DBFileMetadata struct {
+	Type         string `json:"type" bson:"type"`
+	Description  string `json:"description" bson:"description"`
+	UploadedBy   string `json:"uploaded_by" bson:"uploaded_by"`
+	OriginalName string `json:"original_name" bson:"original_name"`
+	Tenant       string `json:"tenant" bson:"tenant,omitempty"`
+}
+
+type GlobalSettings struct {
+	ID          primitive.ObjectID `bson:"_id,omitempty"`
+	Type        string             `json:"type" bson:"type"`
+	Settings    interface{}        `json:"settings" bson:"settings"`
+	LastUpdated time.Time          `json:"last_updated" bson:"last_updated"`
+}
+
+type StreamSettings struct {
+	TargetFPS            int `json:"target_fps,omitempty" bson:"target_fps"`
+	JpegQuality          int `json:"jpeg_quality,omitempty" bson:"jpeg_quality"`
+	ScalingFactorAndroid int `json:"scaling_factor_android,omitempty" bson:"scaling_factor_android"`
+	ScalingFactoriOS     int `json:"scaling_factor_ios,omitempty" bson:"scaling_factor_ios"`
+}
+
+// ClientCredentials represents OAuth2 client credentials for API access
+type ClientCredentials struct {
+	ID           string     `json:"id" bson:"_id,omitempty"`
+	ClientID     string     `json:"client_id" bson:"client_id"`
+	ClientSecret string     `json:"-" bson:"client_secret"` // Never return in JSON (bcrypt hash)
+	SecretLookup string     `json:"-" bson:"secret_lookup"` // SHA256 hash for efficient secret lookup
+	Name         string     `json:"name" bson:"name"`
+	Description  string     `json:"description" bson:"description"`
+	UserID       string     `json:"user_id" bson:"user_id"`
+	Tenant       string     `json:"tenant" bson:"tenant"`
+	IsActive     bool       `json:"is_active" bson:"is_active"`
+	CreatedAt    time.Time  `json:"created_at" bson:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at" bson:"updated_at"`
+	LastUsedAt   *time.Time `json:"last_used_at,omitempty" bson:"last_used_at,omitempty"`
+}
+
+type Workspace struct {
+	ID          string `json:"id" bson:"_id,omitempty" example:"workspace_123"`
+	Name        string `json:"name" bson:"name" example:"Development Team"`
+	Description string `json:"description" bson:"description" example:"Workspace for development team testing"`
+	IsDefault   bool   `json:"is_default" bson:"is_default" example:"false"`
+	Tenant      string `json:"tenant" bson:"tenant,omitempty" example:"acme-corp"`
+}
+
+type WorkspaceWithDeviceCount struct {
+	ID          string `json:"id" bson:"_id,omitempty" example:"workspace_123"`
+	Name        string `json:"name" bson:"name" example:"Development Team"`
+	Description string `json:"description" bson:"description" example:"Workspace for development team testing"`
+	IsDefault   bool   `json:"is_default" bson:"is_default" example:"false"`
+	Tenant      string `json:"tenant" bson:"tenant,omitempty" example:"acme-corp"`
+	DeviceCount int    `json:"device_count" bson:"device_count" example:"5"`
+}
+
+type ProviderLog struct {
+	EventName string `json:"eventname" bson:"eventname"`
+	Level     string `json:"level" bson:"level"`
+	Message   string `json:"message" bson:"message"`
+	Timestamp int64  `json:"timestamp" bson:"timestamp"`
+}
+
+type TizenTVInfo struct {
+	ID        string      `json:"id"`
+	Name      string      `json:"name"`
+	Version   string      `json:"version"`
+	Device    TizenDevice `json:"device"`
+	Type      string      `json:"type"`
+	URI       string      `json:"uri"`
+	Remote    string      `json:"remote"`
+	IsSupport string      `json:"isSupport"`
+}
+
+type TizenDevice struct {
+	Type              string `json:"type"`
+	DUID              string `json:"duid"`
+	Model             string `json:"model"`
+	ModelName         string `json:"modelName"`
+	Description       string `json:"description"`
+	NetworkType       string `json:"networkType"`
+	SSID              string `json:"ssid"`
+	IP                string `json:"ip"`
+	FirmwareVersion   string `json:"firmwareVersion"`
+	Name              string `json:"name"`
+	ID                string `json:"id"`
+	UDN               string `json:"udn"`
+	Resolution        string `json:"resolution"`
+	CountryCode       string `json:"countryCode"`
+	MSFVersion        string `json:"msfVersion"`
+	SmartHubAgreement string `json:"smartHubAgreement"`
+	VoiceSupport      string `json:"VoiceSupport"`
+	GamePadSupport    string `json:"GamePadSupport"`
+	WifiMac           string `json:"wifiMac"`
+	DeveloperMode     string `json:"developerMode"`
+	DeveloperIP       string `json:"developerIP"`
+	OS                string `json:"OS"`
+}
+
+type AndroidFileNode struct {
+	Name     string                      `json:"name"`
+	Children map[string]*AndroidFileNode `json:"children,omitempty"`
+	IsFile   bool                        `json:"isFile"`
+	FullPath string                      `json:"fullPath"`
+	FileDate int64                       `json:"fileDate"`
+}
+
+type AppiumPluginConfiguration struct {
+	ProviderUrl       string `json:"providerUrl"`
+	UDID              string `json:"udid"`
+	HeartBeatInterval string `json:"heartbeatIntervalMs"`
+}
+
+// ValidateDeviceUsageForOS validates that the device usage is compatible with the device OS
+func ValidateDeviceUsageForOS(os, usage string) error {
+	// Normalize OS string to lowercase for case-insensitive comparison
+	normalizedOS := strings.ToLower(strings.TrimSpace(os))
+	normalizedUsage := strings.ToLower(strings.TrimSpace(usage))
+
+	// Validate Tizen devices can only be used for automation
+	if normalizedOS == "tizen" {
+		if normalizedUsage != "automation" {
+			return fmt.Errorf("tizen devices only support 'automation' usage. Current usage '%s' is not supported. Tizen devices can only be used for Appium testing and automation", usage)
+		}
+	}
+
+	// Validate WebOS devices can only be used for automation
+	if normalizedOS == "webos" {
+		if normalizedUsage != "automation" {
+			return fmt.Errorf("webos devices only support 'automation' usage. Current usage '%s' is not supported. WebOS devices can only be used for Appium testing and automation", usage)
+		}
+	}
+
+	// Validate Android TV devices can only be used for automation
+	if normalizedOS == "androidtv" {
+		if normalizedUsage != "automation" {
+			return fmt.Errorf("androidtv devices only support 'automation' usage. Current usage '%s' is not supported. Android TV devices can only be used for Appium testing and automation", usage)
+		}
+	}
+
+	// Validate Roku devices can only be used for automation
+	if normalizedOS == "roku" {
+		if normalizedUsage != "automation" {
+			return fmt.Errorf("roku devices only support 'automation' usage. Current usage '%s' is not supported. Roku devices can only be used for Appium testing and automation", usage)
+		}
+	}
+
+	return nil
+}
+
+// androidTvUDIDPattern matches an explicit IP:PORT address (e.g. 10.30.50.107:5555).
+var androidTvUDIDPattern = regexp.MustCompile(`^([0-9]{1,3}\.){3}[0-9]{1,3}:\d+$`)
+
+// rokuUDIDPattern matches a Roku IP address, optionally with a port (e.g. 10.30.50.112 or 10.30.50.112:8060).
+// Roku is reached over ECP (fixed port 8060), so only the IP is required.
+var rokuUDIDPattern = regexp.MustCompile(`^([0-9]{1,3}\.){3}[0-9]{1,3}(:\d+)?$`)
+
+// ValidateDevice performs comprehensive validation on a device struct
+func ValidateDevice(device *DBDevice) error {
+	if device == nil {
+		return errors.New("device cannot be nil")
+	}
+
+	// Validate OS and Usage combination
+	if err := ValidateDeviceUsageForOS(device.OS, device.Usage); err != nil {
+		return err
+	}
+
+	// Android TV connects over ADB TCP/IP, so the UDID must be an explicit IP:PORT.
+	// The port is required (not assumed) since it must match what the TV exposes.
+	if strings.ToLower(strings.TrimSpace(device.OS)) == "androidtv" {
+		if !androidTvUDIDPattern.MatchString(device.UDID) {
+			return fmt.Errorf("androidtv devices require the UDID in IP:PORT format (e.g. 10.30.50.107:5555)")
+		}
+	}
+
+	// Roku connects over ECP (fixed port 8060), so the UDID must be the TV IP address.
+	if strings.ToLower(strings.TrimSpace(device.OS)) == "roku" {
+		if !rokuUDIDPattern.MatchString(device.UDID) {
+			return fmt.Errorf("roku devices require the UDID to be the TV IP address (e.g. 10.30.50.112)")
+		}
+	}
+
+	return nil
+}
+
+type RunningApp struct {
+	AppName          string `json:"app_name" bson:"-"`
+	BundleIdentifier string `json:"bundle_identifier" bson:"-"`
+}
+
+type DeviceApp struct {
+	AppName          string `json:"app_name" bson:"-"`
+	BundleIdentifier string `json:"bundle_identifier" bson:"-"`
+	Version          string `json:"version" bson:"-"`
+	CanUninstall     bool   `json:"can_uninstall" bson:"-"`
+	IsDevApp         bool   `json:"is_dev_app" bson:"-"`
+}

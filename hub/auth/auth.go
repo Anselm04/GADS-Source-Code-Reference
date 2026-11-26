@@ -1,0 +1,463 @@
+/*
+ * This file is part of GADS.
+ *
+ * Copyright (c) 2022-2025 Nikola Shabanov
+ *
+ * This source code is licensed under the GNU Affero General Public License v3.0.
+ * You may obtain a copy of the license at https://www.gnu.org/licenses/agpl-3.0.html
+ */
+
+package auth
+
+import (
+	"GADS/common/api"
+	"GADS/common/db"
+	"GADS/common/models"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v4"
+)
+
+type AuthCreds struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type ChangePasswordCreds struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// GetOriginFromRequest extracts the origin from request headers
+func GetOriginFromRequest(c *gin.Context) string {
+	// Try to get from Origin header first (standard for CORS)
+	origin := c.GetHeader("Origin")
+	if origin != "" {
+		return normalizeOrigin(origin)
+	}
+
+	// Try Referer header next
+	referer := c.GetHeader("Referer")
+	if referer != "" {
+		// Extract only the origin part from the Referer URL
+		return extractOriginFromURL(referer)
+	}
+
+	// Try X-Origin custom header (might be set by proxies or clients)
+	xorigin := c.GetHeader("X-Origin")
+	if xorigin != "" {
+		return normalizeOrigin(xorigin)
+	}
+
+	// Default to blank origin
+	return ""
+}
+
+// extractOriginFromURL parses a full URL and returns only the origin part (scheme + host + port)
+func extractOriginFromURL(urlStr string) string {
+	parsedURL, err := url.Parse(urlStr)
+	if err != nil {
+		// If parsing fails, return the original string
+		return urlStr
+	}
+
+	// Ensure we have a scheme for URL construction
+	scheme := parsedURL.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+
+	// Return scheme + host (which includes port if specified)
+	return scheme + "://" + parsedURL.Host
+}
+
+// normalizeOrigin ensures the origin has the correct format
+func normalizeOrigin(origin string) string {
+	// If it's already a valid URL, just extract the origin part
+	if strings.HasPrefix(origin, "http://") || strings.HasPrefix(origin, "https://") {
+		return extractOriginFromURL(origin)
+	}
+
+	// If it looks like just a hostname or hostname:port
+	if !strings.Contains(origin, "://") {
+		// Check if it has a port number
+		if strings.Contains(origin, ":") || strings.Count(origin, ".") >= 1 {
+			// Assume it's a hostname or IP with optional port
+			return "http://" + origin
+		}
+	}
+
+	// Return as is if it doesn't match any pattern
+	return origin
+}
+
+// LoginHandler godoc
+// @Summary      User authentication
+// @Description  Authenticate user and return JWT token
+// @Tags         Hub - Authentication
+// @Accept       json
+// @Produce      json
+// @Param        credentials  body      AuthCreds  true  "User credentials"
+// @Success      200          {object}  models.AuthResponse
+// @Failure      400          {object}  models.ErrorResponse
+// @Failure      401          {object}  models.ErrorResponse
+// @Failure      500          {object}  models.ErrorResponse
+// @Router       /authenticate [post]
+func LoginHandler(c *gin.Context) {
+	var creds AuthCreds
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		api.InternalError(c, "Internal server error")
+		return
+	}
+
+	err = json.Unmarshal(body, &creds)
+	if err != nil {
+		api.BadRequest(c, "Internal server error")
+		return
+	}
+
+	user, err := db.GlobalMongoStore.GetUser(creds.Username)
+	if err != nil {
+		api.Unauthorized(c, "Invalid credentials")
+		return
+	}
+	if user.Password != creds.Password {
+		api.Unauthorized(c, "Invalid credentials")
+		return
+	}
+
+	// Define scopes based on user permissions
+	scopes := []string{"user"}
+	if user.Role == "admin" {
+		scopes = append(scopes, "admin")
+	}
+
+	// Get the request origin
+	origin := GetOriginFromRequest(c)
+
+	// Get the default tenant
+	defaultTenant, err := db.GlobalMongoStore.GetOrCreateDefaultTenant()
+	if err != nil {
+		api.InternalError(c, "Failed to get default tenant")
+		return
+	}
+
+	// Start a session and generate the token for it. Every request slides the
+	// session forward, so the reported validity is an inactivity window rather
+	// than a limit on how long the client can keep working
+	token, err := GenerateJWT(user.Username, user.Role, defaultTenant, scopes, origin)
+	if err != nil {
+		api.InternalError(c, "Failed to generate token")
+		return
+	}
+
+	// Response in requested format
+	api.OK(c, "", models.AuthResponse{
+		AccessToken: token,
+		TokenType:   "Bearer",
+		ExpiresIn:   int(TokenTTL().Seconds()),
+		Username:    user.Username,
+		Role:        user.Role,
+	})
+}
+
+// LogoutHandler godoc
+// @Summary      User logout
+// @Description  Ends the session behind the token, which makes the token stop working
+// @Tags         Hub - Authentication
+// @Accept       json
+// @Produce      json
+// @Success      200  {object}  models.SuccessResponse
+// @Failure      500  {object}  models.ErrorResponse
+// @Security     BearerAuth
+// @Router       /logout [post]
+func LogoutHandler(c *gin.Context) {
+	// Check if there's a bearer token
+	authHeader := c.GetHeader("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		// Dropping the session is what actually ends the login - the token is
+		// refused from here on even though it is still correctly signed
+		if claims, err := GetClaimsFromRequest(c); err == nil && claims.SessionID != "" {
+			DeleteSession(claims.SessionID)
+		}
+
+		api.OKMessage(c, "success")
+		return
+	}
+
+	api.InternalError(c, "session does not exist")
+}
+
+// ChangePasswordHandler godoc
+// @Summary      Change own password
+// @Description  Allows an authenticated user to change their own password. The
+// @Description  target user is always derived from the JWT, so a user can never
+// @Description  change another user's password.
+// @Tags         Hub - Authentication
+// @Accept       json
+// @Produce      json
+// @Param        credentials  body      ChangePasswordCreds  true  "Current and new password"
+// @Success      200          {object}  models.SuccessResponse
+// @Failure      400          {object}  models.ErrorResponse
+// @Failure      401          {object}  models.ErrorResponse
+// @Failure      500          {object}  models.ErrorResponse
+// @Security     BearerAuth
+// @Router       /change-password [post]
+func ChangePasswordHandler(c *gin.Context) {
+	// Always resolve the acting user from the token/context - never from the
+	// request body - so a user can only ever change their own password.
+	username := c.GetString("username")
+	if username == "" {
+		claims, err := GetClaimsFromRequest(c)
+		if err != nil || claims.Username == "" {
+			api.Unauthorized(c, "unauthorized")
+			return
+		}
+		username = claims.Username
+	}
+
+	var creds ChangePasswordCreds
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		api.InternalError(c, "Internal server error")
+		return
+	}
+
+	if err = json.Unmarshal(body, &creds); err != nil {
+		api.BadRequest(c, "Invalid request body")
+		return
+	}
+
+	if creds.CurrentPassword == "" || creds.NewPassword == "" {
+		api.BadRequest(c, "Current and new password are required")
+		return
+	}
+
+	if creds.NewPassword == creds.CurrentPassword {
+		api.BadRequest(c, "New password must be different from the current password")
+		return
+	}
+
+	// A failure fetching the user for a valid token is a server-side problem,
+	// not an auth failure - avoid returning 401 so a transient DB error does
+	// not trip the UI interceptor and log the user out.
+	user, err := db.GlobalMongoStore.GetUser(username)
+	if err != nil {
+		api.InternalError(c, "Failed to load user")
+		return
+	}
+
+	// A wrong current password is a bad request, NOT a 401 - the user is
+	// authenticated. Returning 401 here would trip the UI's global response
+	// interceptor and log the user out instead of showing the error.
+	if user.Password != creds.CurrentPassword {
+		api.BadRequest(c, "Current password is incorrect")
+		return
+	}
+
+	if err = db.GlobalMongoStore.UpdateUserPassword(username, creds.NewPassword); err != nil {
+		api.InternalError(c, "Failed to update password")
+		return
+	}
+
+	api.OKMessage(c, "Password updated successfully")
+}
+
+// GetUserInfoHandler godoc
+// @Summary      Get user information
+// @Description  Retrieve user information from JWT token
+// @Tags         Hub - Authentication
+// @Accept       json
+// @Produce      json
+// @Success      200  {object}  models.UserInfoResponse
+// @Failure      401  {object}  models.ErrorResponse
+// @Security     BearerAuth
+// @Router       /user-info [get]
+func GetUserInfoHandler(c *gin.Context) {
+	// Get the JWT token from Authorization header
+	authHeader := c.GetHeader("Authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		api.Unauthorized(c, "missing or invalid authorization header")
+		return
+	}
+
+	tokenString, err := ExtractTokenFromBearer(authHeader)
+	if err != nil {
+		api.Unauthorized(c, "invalid token format")
+		return
+	}
+
+	// Get the request origin
+	origin := GetOriginFromRequest(c)
+
+	// Validate JWT token with the origin (struct claims)
+	claims, err := ValidateJWT(tokenString, origin)
+	if err != nil {
+		api.Unauthorized(c, "invalid or expired token")
+		return
+	}
+
+	// Parse token as MapClaims para acessar claims customizadas
+	parsedToken, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
+	var mapClaims jwt.MapClaims
+	if err == nil {
+		if mc, ok := parsedToken.Claims.(jwt.MapClaims); ok {
+			mapClaims = mc
+		}
+	}
+
+	// Get the secret key for the origin to know which claim to use
+	var userIdentifier string
+	var userIdentifierClaim string
+	store := GetSecretCache().store
+	if store != nil {
+		secretKey, err := store.GetSecretKeyByOrigin(origin)
+		if err != nil {
+			// fallback to default
+			secretKey, _ = store.GetDefaultSecretKey()
+		}
+		if secretKey != nil && secretKey.UserIdentifierClaim != "" {
+			userIdentifierClaim = secretKey.UserIdentifierClaim
+		}
+	}
+
+	// Get the user identifier from the claim
+	if userIdentifierClaim != "" && mapClaims != nil {
+		if val, ok := mapClaims[userIdentifierClaim]; ok {
+			if s, ok := val.(string); ok {
+				userIdentifier = s
+			} else {
+				userIdentifier = "" // ou fmt.Sprintf("%v", val)
+			}
+		} else {
+			// fallback para struct claims
+			switch userIdentifierClaim {
+			case "sub":
+				userIdentifier = claims.Subject
+			case "username":
+				userIdentifier = claims.Username
+			case "userName":
+				userIdentifier = claims.Username
+			case "email":
+				userIdentifier = claims.Username // ou claims.Email se existir
+			default:
+				userIdentifier = claims.Username
+			}
+		}
+	} else {
+		userIdentifier = claims.Username
+	}
+
+	// Define default role if not set
+	role := claims.Role
+	if role == "" {
+		role = "user"
+	}
+
+	// Define default scopes if not set
+	scopes := claims.Scope
+	if len(scopes) == 0 {
+		scopes = []string{"user"}
+	}
+
+	// Return user information from claims
+	api.OK(c, "", models.UserInfoResponse{
+		Username:            userIdentifier,
+		Role:                role,
+		Tenant:              claims.Tenant,
+		Scopes:              scopes,
+		UserIdentifierClaim: userIdentifierClaim,
+	})
+}
+
+// GetClaimsFromRequest extracts a JWT token from the Authorization header or the
+// "token" query parameter, validates it against the request origin, and returns
+// the parsed claims. The query parameter may arrive with or without a "Bearer "
+// prefix (e.g. from WebSocket URLs) — both forms are handled.
+//
+// For tokens the hub issued this is also where the session behind the token is
+// checked and slid forward, so every endpoint resolving claims from a request
+// keeps the session alive and refuses a token whose session is gone.
+func GetClaimsFromRequest(c *gin.Context) (*JWTClaims, error) {
+	var tokenString string
+
+	if authHeader := c.GetHeader("Authorization"); authHeader != "" {
+		t, err := ExtractTokenFromBearer(authHeader)
+		if err != nil {
+			return nil, err
+		}
+		tokenString = t
+	} else if raw := c.Query("token"); raw != "" {
+		// The query param may arrive as "Bearer <token>" (e.g. from WebSocket URLs).
+		// Try to strip the prefix; if it's a bare token, use it as-is.
+		if t, err := ExtractTokenFromBearer(raw); err == nil {
+			tokenString = t
+		} else {
+			tokenString = raw
+		}
+	} else {
+		return nil, errors.New("no token provided")
+	}
+
+	origin := GetOriginFromRequest(c)
+	claims, err := ValidateJWT(tokenString, origin)
+	if err != nil {
+		return nil, err
+	}
+
+	// Tokens from another issuer are not backed by a session - they are valid
+	// for as long as their own expiry says
+	if claims.Issuer == TokenIssuer {
+		if _, err := TouchSession(claims.SessionID); err != nil {
+			return nil, err
+		}
+	}
+
+	return claims, nil
+}
+
+func AuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		path := c.Request.URL.Path
+
+		// Bypass authentication for specific paths
+		if strings.Contains(path, "appium") {
+			c.Next()
+			return
+		}
+
+		claims, err := GetClaimsFromRequest(c)
+		if err != nil {
+			api.AbortUnauthorized(c, "invalid or expired token")
+			return
+		}
+
+		// Check if token has expired
+		if claims.ExpiresAt != nil && claims.ExpiresAt.Time.Before(time.Now()) {
+			api.AbortUnauthorized(c, "token expired")
+			return
+		}
+
+		// Check permissions (admin)
+		if strings.Contains(path, "admin") && claims.Role != "admin" {
+			api.AbortUnauthorized(c, "you need admin privileges to access this endpoint")
+			return
+		}
+
+		// Store user information in context for later use
+		c.Set("username", claims.Username)
+		c.Set("role", claims.Role)
+		c.Set("tenant", claims.Tenant)
+		c.Set("origin", claims.Origin) // Store origin in context
+
+		// Continue execution
+		c.Next()
+	}
+}
